@@ -255,11 +255,13 @@ bool init() {
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_acquired);
     p_vkCreateSemaphore(g_device, &sci, nullptr, &g_rendered);
 
-    // A busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB). Android: 128 MB, half, for an 8 GB
-    // phone (docs/nvn/android-perf/MEMORY.md: the phone never filled it; big uploads have staging buffers, #72).
+    // A busy submit reached 67 MB: the 2048x8192 glyph atlas's first upload (R8 widened to RGBA8), which now has a
+    // staging buffer of its own (nvn_upload.cpp); the scripted run's other submits stay under ~12 MB. Android: 64 MB
+    // (docs/nvn/android-perf/PIPELINES-1810.md: 0 "upload buffer full" lines at 64 and at 32 MB on the PC; staging_wanted
+    // spills bigger uploads to staging buffers in proportion to the ring).
     {
 #if defined(__ANDROID__)
-        uint64_t ring_mb = 128;
+        uint64_t ring_mb = 64;
 #else
         uint64_t ring_mb = 256;
 #endif
