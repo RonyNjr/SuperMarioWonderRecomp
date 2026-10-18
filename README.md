@@ -87,6 +87,13 @@ The details are in the GitHub milestones.
 - **Windowed confirmation of the W7 glitch fixes (#43-#45, #47):** horizon band, silhouettes, present mode.
 - **Character-select blur:** needs a reference from a real console.
 - **Android rendering bugs and performance:** hand-off notes in [docs/nvn/android-perf/](docs/nvn/android-perf/).
+- **Save: a second gameplay save cannot be created when one already exists** (reported on the Galaxy S23,
+  2026-10-18; not investigated yet).
+- **Android: memory pressure and new-shader hitches on the Galaxy S23.** In the course the CPU replay reaches
+  17-18 ms because Android pushes up to 1.8 GB of the game to zram (major faults on the render thread); the GPU
+  waits only 0.1-2 ms. The first time a shader appears its pipeline is compiled on the render thread (905
+  pipelines, 6.9 s in one run). Measured in [docs/nvn/android-perf/MEMORY-1810.md](docs/nvn/android-perf/MEMORY-1810.md),
+  with the plan.
 - **Windows: crash after character select (#5):** not reproduced on Linux; the crash is a rail object whose
   parameter resource was not found (analysis in [docs/nvn/DEBUG-2.md](docs/nvn/DEBUG-2.md), entry #93). Crash
   reports now end with the last files the game opened, to find the missing one.
@@ -220,9 +227,15 @@ the game on the phone from a folder with your `prod.keys` and your XCI/NSP, has 
   Since 2026-10-17 it is **on by default** on integrated GPUs, phones included ("Automatic"); it once drew exploded meshes
   in some courses, so "Synchronous" in the same setting is the way back if the geometry breaks.
   The 30 fps limit and the docked mode have not been timed on a phone yet.
-- **New in the launcher (2026-10-17, built but not yet run on a phone):** Image > **Widescreen** (fills a 19.5:9 / 20:9 screen
-  with a wider view instead of side bars), Performance > **Screen rate** 90/120 Hz (experimental: the game runs faster),
-  Advanced > **Buffer padding** (the safe mode if HUD text or characters glitch).
+- **New in the launcher (2026-10-17):** Image > **Widescreen** (fills a 19.5:9 / 20:9 screen with a wider view instead of
+  side bars), Performance > **Screen rate** 90/120 Hz (experimental: the game runs faster), Advanced > **Buffer padding**
+  (the safe mode if HUD text or characters glitch). Run on a Galaxy S23 on 2026-10-18 with widescreen on: 60 fps in the
+  menus and much of the course, with drops to 30 when Android swaps the game out (see Open).
+- **Updating from an APK built on another computer:** each build machine signs with its own debug key, so Android
+  refuses the update (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`). Uninstall first; that deletes the imported data in the
+  app folder (import again; keep a copy of `user/save` first).
+- **Memory log (2026-10-18):** every 30 s nx.log shows `memory: anon, file, swapped (VmSwap) | MemAvailable, SwapFree`;
+  `NX_UPLOAD_RING_MB=<16..1024>` sets the upload ring (128 MB by default on Android).
 - Measurements, recommended settings, what has and has not run on a device: [docs/WONDER-ANDROID-OPTIONS.md](docs/WONDER-ANDROID-OPTIONS.md).
 
 Touch controls:

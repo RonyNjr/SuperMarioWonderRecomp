@@ -23,6 +23,19 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-10-18: Galaxy S23 analysis, a save bug, PR review
+
+- **S23, what is heavy** ([docs/nvn/android-perf/MEMORY-1810.md](docs/nvn/android-perf/MEMORY-1810.md)): with widescreen,
+  handheld and render scale 0.67, the GPU waits 0.1-2 ms per frame; the CPU replay grows from 1-6 ms (menus) to
+  17-18 ms (course) because Android pushes up to 1.8 GB of the game to zram (measured with the new memory log:
+  anon resident 1018 → 384 MB, swapped 249 → 1774 MB, MemAvailable ~1 GB). New shaders: 905 pipelines compiled in
+  one run. Next: smaller ring, image retention, trimming on low MemAvailable, affinity, pipeline pre-warm.
+- **Save bug (reported, not investigated):** with one gameplay save present, another one cannot be created.
+- **PRs:** #12 (leonardo-spy) merged: fixed today's Windows build break (`getpid`) and the PC packer's `main.npdm`
+  path. #11 (Mac address space, recompiler jump tables) validated on Linux (regenerated code, full build, a 220 s run
+  to the castle without a crash); not merged yet (one benchmark at 58.8 vs 60.0 fps to recheck). #10 waits for #11.
+- **APK:** a build from this machine needs an uninstall over one signed elsewhere (different debug key).
+
 ### 2026-10-17: Linux port, languages, ultrawide, 60 fps on an Intel iGPU, build guide
 
 - **Linux port** (BelmanteGu): `platform_linux.cpp` (SDL3 window, pad, keyboard, audio, Vulkan surface, crash
