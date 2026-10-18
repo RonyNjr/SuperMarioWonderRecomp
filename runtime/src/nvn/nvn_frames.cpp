@@ -68,6 +68,7 @@ struct Slot {
     VkSemaphore acquired = VK_NULL_HANDLE;          // a present's swapchain image
     VkDescriptorPool descriptors = VK_NULL_HANDLE;  // made on first use (presents need none)
     bool descriptors_used = false;
+    uint32_t sets_used = 0, descs_used[16] = {};  // allocated from the pool since its reset (peak logged by frame_log)
     std::atomic<bool> reset_done{true};  // the janitor reset its pools (nvn_janitor.cpp); frame_begin waits for it
     uint64_t serial = 0;    // in flight until retired; 0: free
     uint64_t ring_end = 0;  // the ring position after this submit's data
@@ -99,6 +100,7 @@ uint64_t g_chunk_draws = 0;           // NX_SUBMIT_CHUNK_DRAWS (frame_init); 0: 
 bool g_chunking = false;              // this submit is chunked (frame_plan_split)
 uint64_t g_chunk_from = UINT64_MAX;   // the draw count at the last part's start (UINT64_MAX: the next call's)
 std::atomic<uint64_t> g_game_waits{0}, g_game_wait_ns{0};
+uint32_t g_peak_sets = 0, g_peak_descs[16] = {};  // the most one slot's descriptor pool held in a submit, per log period
 uint64_t g_staging_count = 0, g_staging_bytes = 0;  // staging_alloc's buffers, per log period (PHASE4.md U1)  // the game's waits that blocked (NX_ASYNC_GPU only)
 
 // The upload ring (the synchronous path's upload buffer). Positions only grow; position p is byte p % size. What
@@ -180,11 +182,13 @@ bool retire_oldest() {
             if (g_slot_pools && s->pool_used) p_vkResetCommandPool(vk_device(), s->pool, 0);
             if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
             s->pool_used = s->descriptors_used = false;
+            s->sets_used = 0, std::fill(std::begin(s->descs_used), std::end(s->descs_used), 0u);
             s->reset_done.store(true, std::memory_order_release);
         });
     } else {
         if (s->descriptors_used) p_vkResetDescriptorPool(vk_device(), s->descriptors, 0);
         s->descriptors_used = false;
+        s->sets_used = 0, std::fill(std::begin(s->descs_used), std::end(s->descs_used), 0u);
     }
     g_tail = std::max(g_tail, s->ring_end);
     g_completed = s->serial;
@@ -515,6 +519,15 @@ void frame_log(uint64_t frames) {
     if (uint64_t waits = g_game_waits.exchange(0))
         log("nvn/vk: the game's waits (syncs, finish, pool invalidate/finalize): %llu blocked, %.2f ms per frame",
             (unsigned long long)waits, double(g_game_wait_ns.exchange(0)) / 1e6 / double(frames));
+    if (g_peak_sets) {
+        log("nvn/vk: descriptor pool peak per submit: %u sets, ubo %u, ubo dynamic %u, ssbo %u, sampler %u, storage image %u, "
+            "texel %u+%u (pool: 32768 sets, 65536 / 65536 / 16384 / 65536 / 4096 / 1024+1024)",
+            g_peak_sets, g_peak_descs[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER], g_peak_descs[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC],
+            g_peak_descs[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER], g_peak_descs[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER],
+            g_peak_descs[VK_DESCRIPTOR_TYPE_STORAGE_IMAGE], g_peak_descs[VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER],
+            g_peak_descs[VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER]);
+        g_peak_sets = 0, std::fill(std::begin(g_peak_descs), std::end(g_peak_descs), 0u);
+    }
     if (g_staging_count)
         log("nvn/vk: staging: %llu buffers, %.1f MB over %llu frames", (unsigned long long)g_staging_count,
             double(g_staging_bytes) / 1e6, (unsigned long long)frames);
@@ -555,6 +568,13 @@ VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout) {
     Slot& s = *g_current;
     if (!s.descriptors) s.descriptors = make_descriptor_pool();
     s.descriptors_used = true;
+    {
+        uint32_t c[16] = {};
+        descriptor_layout_counts(layout, c);
+        s.sets_used++;
+        g_peak_sets = std::max(g_peak_sets, s.sets_used);
+        for (int t = 0; t < 16; t++) s.descs_used[t] += c[t], g_peak_descs[t] = std::max(g_peak_descs[t], s.descs_used[t]);
+    }
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = s.descriptors;
     ai.descriptorSetCount = 1;

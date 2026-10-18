@@ -1,6 +1,13 @@
 // Pipelines and sampled resources (nvn_pipeline.h). Everything is cached for the life of the process: layouts by
 // their bindings, pipelines by their full state, samplers by their state, views by (image, type).
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #ifdef _WIN32
@@ -88,6 +95,7 @@ VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, ui
     std::string k = kinds && !off ? std::string(reinterpret_cast<const char*>(kinds), 16) : std::string(16, '\0');
     auto& m = cache[{s, k, unwritten}];
     if (!m) {
+        const uint64_t module_t0 = plat::monotonic_ns();
         bool is_patched = false;
         const uint8_t* int_kinds = k != std::string(16, '\0') ? reinterpret_cast<const uint8_t*>(k.data()) : nullptr;
         std::vector<uint32_t> code = patched_spirv(s, int_kinds, unwritten, &is_patched);
@@ -119,9 +127,15 @@ VkShaderModule module_of(const ShaderInfo* s, const uint8_t* kinds = nullptr, ui
         ci.codeSize = code.size() * 4;
         ci.pCode = code.data();
         if (p_vkCreateShaderModule(vk_device(), &ci, nullptr, &m) != VK_SUCCESS) log("nvn/vk: shader %s rejected", s->hash.c_str());
+        note_module_created(plat::monotonic_ns() - module_t0);
         static int logged = 0;
         if (is_patched && logged++ < 20) log("nvn/vk: shader %s: integer vertex inputs", s->hash.c_str());
     }
+    return m;
+}
+
+std::unordered_map<VkDescriptorSetLayout, std::array<uint32_t, 16>>& layout_counts() {
+    static std::unordered_map<VkDescriptorSetLayout, std::array<uint32_t, 16>> m;
     return m;
 }
 
@@ -134,6 +148,9 @@ VkDescriptorSetLayout set_layout(const std::vector<VkDescriptorSetLayoutBinding>
         ci.bindingCount = uint32_t(bindings.size());
         ci.pBindings = bindings.data();
         p_vkCreateDescriptorSetLayout(vk_device(), &ci, nullptr, &l);
+        auto& c = layout_counts()[l];  // for the descriptor pool's peak use (nvn_frames.cpp)
+        for (const auto& b : bindings)
+            if (b.descriptorType < 16) c[b.descriptorType] += b.descriptorCount;
     }
     return l;
 }
@@ -232,6 +249,13 @@ bool ufloat_raw() {
 
 }  // namespace
 
+bool descriptor_layout_counts(VkDescriptorSetLayout layout, uint32_t (&out)[16]) {
+    auto it = layout_counts().find(layout);
+    if (it == layout_counts().end()) return false;
+    std::copy(it->second.begin(), it->second.end(), out);
+    return true;
+}
+
 // ---- layouts ----------------------------------------------------------------------------------------------------------
 
 const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages) {
@@ -288,21 +312,433 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
 
 // ---- graphics pipelines ---------------------------------------------------------------------------------------------
 
-VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout) {
-    // By the key's bytes, as before, but hashed (nvn_pipeline.h) instead of a ~700-byte std::string built and
-    // compared down a tree per draw; and the last entry first: consecutive draws mostly share their state.
-    using Key = ByteKey<sizeof(PipelineKey)>;
-    static std::unordered_map<Key, VkPipeline, ByteKeyHash> cache;
-    static const std::pair<const Key, VkPipeline>* last = nullptr;  // entries are never erased
-    if (last && std::memcmp(&key, last->first.b, sizeof key) == 0) return last->second;
-    Key k;
-    std::memcpy(k.b, &key, sizeof key);
-    if (auto it = cache.find(k); it != cache.end()) return (last = &*it)->second;
+namespace {
 
+using PKey = ByteKey<sizeof(PipelineKey)>;
+
+PipelineKey canonical_key(const PipelineKey& in);
+
+void dyn_init(VkDynamicState (&d)[7]) {
+    const VkDynamicState v[7] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                 VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_BIAS};
+    std::memcpy(d, v, sizeof v);
+}
+
+// Everything vkCreateGraphicsPipelines reads, owned (the create info points into this object), so that the compile
+// can run on another thread than the one that prepared it. Never moved after prepare_graphics_pipeline.
+struct PipeBuild {
     VkPipelineShaderStageCreateInfo stages[2]{};
     VkSpecializationInfo spec_info{};
     float uw_x_value = 1.0f;
     uint32_t nstages = 0;
+    std::vector<VkVertexInputAttributeDescription> attrs;
+    std::vector<VkVertexInputBindingDescription> binds;
+    VkPipelineVertexInputStateCreateInfo vi{};
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    VkPipelineViewportDepthClipControlCreateInfoEXT clip{};
+    VkPipelineViewportStateCreateInfo vp{};
+    VkPipelineRasterizationStateCreateInfo rs{};
+    VkPipelineMultisampleStateCreateInfo ms{};
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    VkPipelineColorBlendAttachmentState att[8]{};
+    VkPipelineColorBlendStateCreateInfo cb{};
+    VkDynamicState dyn[7]{};
+    VkPipelineDynamicStateCreateInfo dy{};
+    VkFormat color_formats[8]{};
+    VkPipelineRenderingCreateInfo ri{};
+    VkGraphicsPipelineCreateInfo ci{};
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    std::string vs_hash, fs_hash;
+};
+
+std::unique_ptr<PipeBuild> prepare_graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
+
+// vkCreateGraphicsPipelines on a prepared build. Thread-safe: the device functions are, and the VkPipelineCache is
+// internally synchronized (it is not created EXTERNALLY_SYNCHRONIZED).
+thread_local bool t_worker = false;
+VkPipeline compile(PipeBuild& b) {
+    VkPipeline p = VK_NULL_HANDLE;
+    const uint64_t t0 = plat::monotonic_ns();
+    VkResult made = p_vkCreateGraphicsPipelines(vk_device(), b.cache, 1, &b.ci, nullptr, &p);
+    note_pipeline_created(plat::monotonic_ns() - t0, t_worker);
+    if (made != VK_SUCCESS) {
+        log("nvn/vk: pipeline for %s + %s failed", b.vs_hash.c_str(), b.fs_hash.c_str());
+        p = VK_NULL_HANDLE;
+    } else if (g_trace) {
+        log("nvn/vk: pipeline: %s + %s", b.vs_hash.c_str(), b.fs_hash.c_str());
+    }
+    return p;
+}
+
+// A compile that runs on a worker thread (prewarm, NX_ASYNC_PIPELINES) or is claimed by the replay thread that
+// needs the result first: whoever moves `state` 0 -> 1 runs it.
+struct PipeTask {
+    std::unique_ptr<PipeBuild> build;
+    std::atomic<int> state{0};  // 0 queued, 1 running, 2 done
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    std::mutex m;
+    std::condition_variable cv;
+    void run() {
+        int expect = 0;
+        if (!state.compare_exchange_strong(expect, 1)) return;
+        VkPipeline p = compile(*build);
+        {
+            std::lock_guard lk(m);
+            pipeline = p;
+            state.store(2);
+        }
+        cv.notify_all();
+        build.reset();
+    }
+    VkPipeline wait() {
+        run();  // not started: do it here
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return state.load() == 2; });
+        return pipeline;
+    }
+};
+
+struct Pool {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::shared_ptr<PipeTask>> q;
+    unsigned threads = 0;
+};
+
+Pool& pool() {
+    // Leaked on purpose: the workers are detached and may still sit in a driver call at exit.
+    static Pool* p = [] {
+        auto* pl = new Pool;
+        const char* e = std::getenv("NX_PIPE_THREADS");
+        unsigned hw = std::thread::hardware_concurrency();
+        unsigned n = e ? unsigned(std::atoi(e)) : std::min(2u, hw > 1 ? hw - 1 : 1u);
+        pl->threads = std::min(n, 8u);
+        for (unsigned i = 0; i < pl->threads; i++)
+            std::thread([pl] {
+                t_worker = true;
+                for (;;) {
+                    std::shared_ptr<PipeTask> t;
+                    {
+                        std::unique_lock lk(pl->m);
+                        pl->cv.wait(lk, [&] { return !pl->q.empty(); });
+                        t = std::move(pl->q.front());
+                        pl->q.pop_front();
+                    }
+                    t->run();
+                }
+            }).detach();
+        return pl;
+    }();
+    return *p;
+}
+
+void enqueue(const std::shared_ptr<PipeTask>& t) {
+    Pool& pl = pool();
+    {
+        std::lock_guard lk(pl.m);
+        pl.q.push_back(t);
+    }
+    pl.cv.notify_one();
+}
+
+// NX_PIPE_VERIFY=1: what the pipeline create info says, without pointers, for comparing the raw key's build with the
+// canonical key's (canonical_key must change nothing Vulkan reads).
+std::string serialize_build(const PipeBuild& b) {
+    std::string o;
+    auto mark = [&o](int id) { o.push_back(char(0xFF)), o.push_back(char(id)); };
+    auto add = [&o](const void* p, size_t n) { o.append(static_cast<const char*>(p), n); };
+    mark(0);
+    for (uint32_t i = 0; i < b.nstages; i++) {
+    mark(1);
+        add(&b.stages[i].stage, sizeof b.stages[i].stage), add(&b.stages[i].module, sizeof b.stages[i].module);
+        if (b.stages[i].pSpecializationInfo) add(b.stages[i].pSpecializationInfo->pData, sizeof(float));
+    }
+    mark(2);
+    add(b.attrs.data(), b.attrs.size() * sizeof b.attrs[0]);
+    mark(3);
+    add(b.binds.data(), b.binds.size() * sizeof b.binds[0]);
+    mark(4);
+    add(&b.ia.topology, sizeof b.ia.topology);
+    mark(5);
+    add(&b.vp.viewportCount, sizeof b.vp.viewportCount);
+    mark(6);
+    add(&b.clip.negativeOneToOne, sizeof b.clip.negativeOneToOne);
+    mark(7);
+    { char has_clip = b.vp.pNext != nullptr; add(&has_clip, 1); }
+    mark(8);
+    {
+        VkBool32 bias = b.rs.depthBiasEnable && b.ds.depthTestEnable;  // a bias with no depth test changes nothing
+        add(&b.rs.depthClampEnable, sizeof(VkBool32)), add(&b.rs.rasterizerDiscardEnable, sizeof(VkBool32));
+        add(&bias, sizeof bias);
+    }
+    mark(9);
+    add(&b.rs.polygonMode, sizeof b.rs.polygonMode), add(&b.rs.cullMode, sizeof b.rs.cullMode);
+    mark(10);
+    add(&b.rs.frontFace, sizeof b.rs.frontFace);
+    mark(11);
+    add(&b.ms.rasterizationSamples, sizeof b.ms.rasterizationSamples);
+    mark(12);
+    add(&b.ms.alphaToCoverageEnable, sizeof b.ms.alphaToCoverageEnable);
+    const auto& d = b.ds;
+    mark(13);
+    for (const auto* v : {&d.depthTestEnable, &d.depthWriteEnable, &d.stencilTestEnable}) add(v, sizeof *v);
+    mark(14);
+    if (d.depthTestEnable) add(&d.depthCompareOp, sizeof d.depthCompareOp);  // ignored with the test off
+    mark(15);
+    if (d.stencilTestEnable) add(&d.front, sizeof d.front), add(&d.back, sizeof d.back);
+    mark(16);
+    for (uint32_t i = 0; i < b.cb.attachmentCount; i++) {
+        const auto& a = b.att[i];
+        add(&a.blendEnable, sizeof a.blendEnable), add(&a.colorWriteMask, sizeof a.colorWriteMask);
+        if (a.blendEnable) add(&a, sizeof a);  // factors and ops are ignored with the blend off
+    }
+    mark(17);
+    add(&b.cb.attachmentCount, sizeof b.cb.attachmentCount);
+    mark(18);
+    add(b.dyn, sizeof b.dyn);
+    mark(19);
+    add(&b.ri.colorAttachmentCount, sizeof b.ri.colorAttachmentCount);
+    mark(20);
+    add(b.color_formats, b.ri.colorAttachmentCount * sizeof(VkFormat));
+    mark(21);
+    add(&b.ri.depthAttachmentFormat, sizeof b.ri.depthAttachmentFormat);
+    mark(22);
+    add(&b.ri.stencilAttachmentFormat, sizeof b.ri.stencilAttachmentFormat);
+    mark(23);
+    add(&b.ci.renderPass, sizeof b.ci.renderPass), add(&b.ci.layout, sizeof b.ci.layout);
+    return o;
+}
+
+// Replay-thread state: pipelines by canonical key, and compiles in flight.
+std::unordered_map<PKey, VkPipeline, ByteKeyHash> g_canon;
+std::unordered_map<PKey, std::shared_ptr<PipeTask>, ByteKeyHash> g_inflight;
+size_t g_prewarm_inflight = 0;
+
+void adopt_finished() {
+    for (auto it = g_inflight.begin(); it != g_inflight.end();) {
+        if (it->second->state.load() == 2) {
+            g_canon.emplace(it->first, it->second->pipeline);
+            it = g_inflight.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+PKey bytes_of(const PipelineKey& k) {
+    PKey out;
+    std::memcpy(out.b, &k, sizeof k);
+    return out;
+}
+
+// NX_ASYNC_PIPELINES=1: a draw whose pipeline is not built yet is skipped (the pipeline compiles on a worker thread
+// and the next frames draw it) instead of stalling the replay. Changes the picture for those frames; off by default.
+bool async_skip() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_ASYNC_PIPELINES");
+        return e && e[0] == '1' && pool().threads > 0;
+    }();
+    return on;
+}
+
+// The pipeline for a canonical key: built, in flight (waited for, or null under async_skip), or compiled now.
+VkPipeline pipeline_for(const PipelineKey& canon, const ProgramLayout& layout, bool* pending) {
+    PKey ck = bytes_of(canon);
+    if (auto it = g_canon.find(ck); it != g_canon.end()) {
+        note_pipeline_alias();
+        return it->second;
+    }
+    if (auto it = g_inflight.find(ck); it != g_inflight.end()) {
+        std::shared_ptr<PipeTask> t = it->second;
+        if (t->state.load() != 2) {
+            if (async_skip()) return *pending = true, VK_NULL_HANDLE;
+            const uint64_t t0 = plat::monotonic_ns();
+            t->wait();
+            note_pipeline_waited(plat::monotonic_ns() - t0);
+        }
+        g_canon.emplace(ck, t->pipeline);
+        g_inflight.erase(ck);
+        return t->pipeline;
+    }
+    warm_record(canon);
+    auto build = prepare_graphics_pipeline(canon, layout);
+    if (async_skip()) {
+        auto t = std::make_shared<PipeTask>();
+        t->build = std::move(build);
+        g_inflight.emplace(ck, t);
+        enqueue(t);
+        return *pending = true, VK_NULL_HANDLE;
+    }
+    VkPipeline p = compile(*build);
+    g_canon.emplace(ck, p);
+    return p;
+}
+
+}  // namespace
+
+VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout) {
+    // By the key's bytes, as before, but hashed (nvn_pipeline.h) instead of a ~700-byte std::string built and
+    // compared down a tree per draw; and the last entry first: consecutive draws mostly share their state.
+    static std::unordered_map<PKey, VkPipeline, ByteKeyHash> cache;
+    static const std::pair<const PKey, VkPipeline>* last = nullptr;  // entries are never erased
+    if (last && std::memcmp(&key, last->first.b, sizeof key) == 0) return last->second;
+    PKey k = bytes_of(key);
+    if (auto it = cache.find(k); it != cache.end()) return (last = &*it)->second;
+
+    // A new raw key. The same Vulkan pipeline may already exist under another raw key that differs only in state
+    // Vulkan ignores (see canonical_key): look it up by its canonical key before compiling.
+    static const bool canon_off = std::getenv("NX_PIPE_CANON") && std::getenv("NX_PIPE_CANON")[0] == '0';  // A/B
+    PipelineKey canon = canon_off ? key : canonical_key(key);
+    static const bool verify = std::getenv("NX_PIPE_VERIFY") != nullptr;
+    if (verify) {
+        static uint64_t checked = 0, bad = 0;
+        std::string a = serialize_build(*prepare_graphics_pipeline(key, layout));
+        std::string b = serialize_build(*prepare_graphics_pipeline(canon, layout));
+        checked++;
+        if (a != b && ++bad <= 20) {
+            size_t i = 0;
+            while (i < a.size() && i < b.size() && a[i] == b[i]) i++;
+            int sec = -1;
+            for (size_t j = i; j-- > 0;) if (uint8_t(a[j]) == 0xFF && j + 1 < a.size()) { sec = uint8_t(a[j + 1]); break; }
+            log("nvn/vk: PIPE_VERIFY first difference after marker %d, offset %zu", sec, i);
+        }
+        if (a != b && bad <= 20)
+            log("nvn/vk: PIPE_VERIFY mismatch %llu of %llu: vs %s fs %s", (unsigned long long)bad, (unsigned long long)checked,
+                key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
+        if (checked % 100 == 0 || a != b) log("nvn/vk: PIPE_VERIFY checked %llu raw keys, %llu differ", (unsigned long long)checked, (unsigned long long)bad);
+    }
+    bool pending = false;
+    VkPipeline p = pipeline_for(canon, layout, &pending);
+    if (pending) {
+        note_pipeline_skipped();
+        return VK_NULL_HANDLE;  // not remembered: asked again by the next draw
+    }
+    return (last = &*cache.emplace(k, p).first)->second;
+}
+
+// Once per submit (replay thread): collect finished compiles, and start the pipelines of earlier sessions
+// (pipelines_*.keys) whose shaders the game has loaded by now.
+void pipeline_warm_step() {
+    adopt_finished();
+    g_prewarm_inflight = g_inflight.size();
+    static const bool on = [] {
+        const char* e = std::getenv("NX_PIPE_PREWARM");
+        return !(e && e[0] == '0') && pool().threads > 0;
+    }();
+    if (!on) return;
+    static size_t cursor = 0;
+    static bool loaded = false;
+    static std::vector<WarmRec> recs;
+    static std::vector<bool> done;
+    static size_t remaining = 0;
+    if (!loaded) {
+        loaded = true;
+        warm_load(recs);
+        done.assign(recs.size(), false);
+        remaining = recs.size();
+        if (remaining) log("nvn/vk: prewarm: %zu pipelines from earlier sessions", remaining);
+    }
+    if (!remaining) return;
+    const uint64_t t0 = plat::monotonic_ns();
+    constexpr uint64_t kBudgetNs = 1000000;  // replay-thread time per submit spent preparing builds
+    for (size_t scanned = 0; scanned < std::min<size_t>(recs.size(), 64) && g_prewarm_inflight < 32; scanned++) {  // 64 lookups per submit: the shaders of other courses never load
+        if (plat::monotonic_ns() - t0 > kBudgetNs) break;
+        size_t i = cursor++ % recs.size();
+        if (done[i]) continue;
+        WarmRec& r = recs[i];
+        const ShaderInfo* vs = shader_by_hash(r.vs);
+        const ShaderInfo* fs = r.fs[0] ? shader_by_hash(r.fs) : nullptr;
+        if (!vs || (r.fs[0] && !fs)) continue;  // the game has not loaded them yet
+        done[i] = true, remaining--;
+        PipelineKey key = r.key;
+        key.vs = vs, key.fs = fs;
+        PKey ck = bytes_of(key);
+        if (g_canon.count(ck) || g_inflight.count(ck)) continue;
+        std::vector<const ShaderInfo*> stages{vs};
+        if (fs) stages.push_back(fs);
+        auto t = std::make_shared<PipeTask>();
+        t->build = prepare_graphics_pipeline(key, program_layout(stages));
+        g_inflight.emplace(ck, t);
+        enqueue(t);
+        g_prewarm_inflight++;
+        note_pipeline_prewarmed();
+    }
+    // Count the ones that finished (adopt_finished erased them from g_inflight): recompute the in-flight count.
+    g_prewarm_inflight = g_inflight.size();
+}
+
+
+namespace {
+
+// The key reduced to what prepare_graphics_pipeline reads: state Vulkan ignores is zeroed, so draws whose raw keys
+// differ only there (an attribute no vertex input reads, factors of a disabled blend, stencil ops with the test off,
+// everything depth on a pass without a depth attachment...) share one pipeline. Output is unchanged: every field
+// zeroed here is one the pipeline creation never reads, or reads only where it has no effect.
+PipelineKey canonical_key(const PipelineKey& in) {
+    PipelineKey k;
+    std::memset(&k, 0, sizeof k);  // compared byte for byte
+    k.vs = in.vs, k.fs = in.fs, k.topology = in.topology;
+    uint32_t used_streams = 0, max_loc = 0;
+    if (in.vs)
+        for (const ShaderIo& io : in.vs->refl.inputs) {
+            if (io.location >= 16 || io.location >= in.attrib_count) continue;
+            const VertexAttrib& va = in.attribs[io.location];
+            k.attribs[io.location].format = va.format;  // also the integer-input kind of the vertex module
+            max_loc = std::max(max_loc, io.location + 1);
+            if (vk_vertex_format(va.format) != VK_FORMAT_UNDEFINED && va.stream < 15) {
+                k.attribs[io.location] = va;
+                used_streams |= 1u << va.stream;
+            }
+        }
+    k.attrib_count = max_loc;
+    for (uint32_t s = 0; s < 15; s++)
+        if (used_streams >> s & 1) k.streams[s] = in.streams[s], k.stream_count = s + 1;
+    const uint32_t n = std::min<uint32_t>(in.color_count, 8);
+    k.color_count = in.color_count;
+    for (uint32_t i = 0; i < n; i++) {
+        k.color_formats[i] = in.color_formats[i];
+        k.mask.mask[i] = in.mask.mask[i] & 0xF;
+        if (in.color.blend_enable[i]) {
+            k.color.blend_enable[i] = 1;
+            k.blend[i] = in.blend[i];
+            k.blend[i].target = 0;
+        }
+    }
+    k.ufloat_colors = in.ufloat_colors & (n >= 32 ? ~0u : (1u << n) - 1);
+    k.depth_format = in.depth_format;
+    if (in.depth_format != VK_FORMAT_UNDEFINED) {
+        k.depth.depth_test = in.depth.depth_test ? 1 : 0, k.depth.depth_write = in.depth.depth_write ? 1 : 0;
+        if (in.depth.depth_test) k.depth.depth_func = in.depth.depth_func;
+        if (in.depth.stencil_test) {  // field by field: the struct has padding bytes the key compares
+            k.depth.stencil_test = 1;
+            for (int f = 0; f < 2; f++) {
+                k.depth.stencil_func[f] = in.depth.stencil_func[f], k.depth.stencil_fail[f] = in.depth.stencil_fail[f];
+                k.depth.depth_fail[f] = in.depth.depth_fail[f], k.depth.depth_pass[f] = in.depth.depth_pass[f];
+            }
+        }
+    }
+    k.polygon.cull = in.polygon.cull;
+    k.polygon.front = in.polygon.front == 0 ? 0 : 1;
+    k.polygon.mode = in.polygon.mode <= 1 ? in.polygon.mode : 2;
+    uint32_t offset_bit = in.polygon.mode <= 2 ? 1u << in.polygon.mode : 4u;
+    k.polygon.offset_enables = in.polygon.offset_enables & offset_bit ? 7 : 0;
+    k.depth_clamp = in.depth_clamp && vk_features().depthClamp ? 1 : 0;
+    k.alpha_to_coverage = in.alpha_to_coverage ? 1 : 0;
+    k.uw_x = in.uw_x;
+    return k;
+}
+
+std::unique_ptr<PipeBuild> prepare_graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout) {
+    auto build = std::make_unique<PipeBuild>();
+    PipeBuild& B = *build;
+    B.cache = pipeline_cache();  // created here, on the replay thread, before any worker needs it
+    B.vs_hash = key.vs ? key.vs->hash : "-", B.fs_hash = key.fs ? key.fs->hash : "-";
+    std::memcpy(B.color_formats, key.color_formats, sizeof B.color_formats);
+    VkPipelineShaderStageCreateInfo(&stages)[2] = B.stages;
+    VkSpecializationInfo& spec_info = B.spec_info;
+    float& uw_x_value = B.uw_x_value;
+    uint32_t& nstages = B.nstages;
     uint8_t int_kinds[16] = {};
     for (uint32_t a = 0; a < key.attrib_count && a < 16; a++) int_kinds[a] = uint8_t(vertex_int_kind(key.attribs[a].format));
     // NX_TRACE_PIPELINES=1: every new pipeline's shaders, and each vertex shader's inputs once.
@@ -338,8 +774,8 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
 
     // Vertex input: each shader input location reads the attribute of the same index. Locations with no attribute
     // (or an unknown format) read a zero vec4 from binding 15.
-    std::vector<VkVertexInputAttributeDescription> attrs;
-    std::vector<VkVertexInputBindingDescription> binds;
+    std::vector<VkVertexInputAttributeDescription>& attrs = B.attrs;
+    std::vector<VkVertexInputBindingDescription>& binds = B.binds;
     bool streams_used[16] = {}, zero_used = false;
     if (key.vs)
         for (const ShaderIo& in : key.vs->refl.inputs) {
@@ -361,22 +797,27 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
             binds.push_back({s, vs.stride, vs.divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
         }
     if (zero_used) binds.push_back({15, 0, VK_VERTEX_INPUT_RATE_INSTANCE});
-    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineVertexInputStateCreateInfo& vi = B.vi;
+    vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = uint32_t(binds.size());
     vi.pVertexBindingDescriptions = binds.data();
     vi.vertexAttributeDescriptionCount = uint32_t(attrs.size());
     vi.pVertexAttributeDescriptions = attrs.data();
 
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo& ia = B.ia;
+    ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = vk_topology(key.topology);
 
-    VkPipelineViewportDepthClipControlCreateInfoEXT clip{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
+    VkPipelineViewportDepthClipControlCreateInfoEXT& clip = B.clip;
+    clip = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
     clip.negativeOneToOne = VK_TRUE;  // NVN depth mode 0 (Wonder): clip-space z in -1..1
-    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo& vp = B.vp;
+    vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = vp.scissorCount = 1;
     if (vk_depth_clip_control() && !depth_remap()) vp.pNext = &clip;
 
-    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo& rs = B.rs;
+    rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = key.polygon.mode == 0 ? VK_POLYGON_MODE_POINT : key.polygon.mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     rs.cullMode = vk_cull(key.polygon.cull);
     // NVNfrontFace CW 0 / CCW 1, taken as is: the draws use a negative-height viewport (nvn_draw.cpp) that gives NVN's
@@ -392,7 +833,8 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     uint32_t offset_bit = key.polygon.mode <= 2 ? 1u << key.polygon.mode : 4u;
     rs.depthBiasEnable = key.polygon.offset_enables & offset_bit || equal_slack_pass(key.depth) ? VK_TRUE : VK_FALSE;
 
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo& ms = B.ms;
+    ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     // BindMultisampleState's alpha to coverage (G7; single-sampled targets: alpha under 0.5 drops the fragment),
     // logged once per pipeline that has it. NX_NO_ALPHA_TO_COVERAGE=1: off, as when it was a stub.
@@ -401,7 +843,8 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     if (key.alpha_to_coverage)
         log("nvn/vk: alpha to coverage%s: fs %s", no_a2c ? " (off)" : "", key.fs ? key.fs->hash.c_str() : "-");
 
-    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineDepthStencilStateCreateInfo& ds = B.ds;
+    ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     bool has_depth = key.depth_format != VK_FORMAT_UNDEFINED;
     ds.depthTestEnable = has_depth && key.depth.depth_test;
     ds.depthWriteEnable = has_depth && key.depth.depth_write;
@@ -424,7 +867,7 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
         faces[f]->compareMask = faces[f]->writeMask = 0xFF;  // dynamic: SetStencilValueMask / SetStencilMask
     }
 
-    VkPipelineColorBlendAttachmentState att[8]{};
+    VkPipelineColorBlendAttachmentState(&att)[8] = B.att;
     for (uint32_t k = 0; k < key.color_count; k++) {
         const BlendTarget& b = key.blend[k];
         // An R11G11B10F target's destination alpha is 1 on Maxwell; the RGBA16F image holds what the shader wrote.
@@ -446,27 +889,30 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
         att[k].alphaBlendOp = vk_blend_op(b.eq_a);
         att[k].colorWriteMask = key.mask.mask[k] & 0xF;
     }
-    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkPipelineColorBlendStateCreateInfo& cb = B.cb;
+    cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = key.color_count;
     cb.pAttachments = att;
 
     // Stencil reference and masks and depth bias values come from command-buffer calls (nvn_raster.cpp), so they are
     // dynamic: one pipeline for every value the game uses.
-    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-                            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-                            VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_BIAS};
-    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    VkDynamicState(&dyn)[7] = B.dyn;
+    dyn_init(dyn);
+    VkPipelineDynamicStateCreateInfo& dy = B.dy;
+    dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = uint32_t(sizeof dyn / sizeof dyn[0]);
     dy.pDynamicStates = dyn;
 
-    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkPipelineRenderingCreateInfo& ri = B.ri;
+    ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     ri.colorAttachmentCount = key.color_count;
-    ri.pColorAttachmentFormats = key.color_formats;
+    ri.pColorAttachmentFormats = B.color_formats;
     bool stencil = key.depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT || key.depth_format == VK_FORMAT_S8_UINT;
     ri.depthAttachmentFormat = key.depth_format == VK_FORMAT_S8_UINT ? VK_FORMAT_UNDEFINED : key.depth_format;
     ri.stencilAttachmentFormat = stencil ? key.depth_format : VK_FORMAT_UNDEFINED;
 
-    VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo& ci = B.ci;
+    ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     ci.pNext = &ri;
     if (render_pass_objects())  // nvn_renderpass.cpp: compatible with every pass of these formats
         ci.pNext = nullptr, ci.renderPass = compatible_render_pass(key.color_count, key.color_formats, key.depth_format);
@@ -481,16 +927,10 @@ VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout
     ci.pColorBlendState = &cb;
     ci.pDynamicState = &dy;
     ci.layout = layout.layout;
-    VkPipeline p = VK_NULL_HANDLE;
-    const uint64_t t0 = plat::monotonic_ns();
-    VkResult made = p_vkCreateGraphicsPipelines(vk_device(), pipeline_cache(), 1, &ci, nullptr, &p);
-    note_pipeline_created(plat::monotonic_ns() - t0);
-    if (made != VK_SUCCESS)
-        log("nvn/vk: pipeline for %s + %s failed", key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
-    else if (g_trace)
-        log("nvn/vk: pipeline %zu: %s + %s", cache.size() + 1, key.vs ? key.vs->hash.c_str() : "-", key.fs ? key.fs->hash.c_str() : "-");
-    return (last = &*cache.emplace(k, p).first)->second;
+    return build;
 }
+
+}  // namespace
 
 // ---- sampled textures -------------------------------------------------------------------------------------------------
 
@@ -528,7 +968,10 @@ void apply_texel_writes(VkCommandBuffer cb, Texture& t, GpuImage& img) {
 
 uint64_t g_submit_serial = 0;
 
-void pipeline_begin_submit() { g_submit_serial++; }
+void pipeline_begin_submit() {
+    g_submit_serial++;
+    pipeline_warm_step();
+}
 
 uint64_t g_not_ready[6];  // why sampled_ready said no: no image, dirty, texel writes, rendered, not uploaded, layout
 
