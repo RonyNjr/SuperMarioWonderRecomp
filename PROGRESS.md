@@ -30,7 +30,12 @@ NVN implemented over Vulkan (MoltenVK).
   17-18 ms (course) because Android pushes up to 1.8 GB of the game to zram (measured with the new memory log:
   anon resident 1018 → 384 MB, swapped 249 → 1774 MB, MemAvailable ~1 GB). New shaders: 905 pipelines compiled in
   one run. Next: smaller ring, image retention, trimming on low MemAvailable, affinity, pipeline pre-warm.
-- **Save bug (reported, not investigated):** with one gameplay save present, another one cannot be created.
+- **Save bug:** with one gameplay save present, another one cannot be created. Cause found: saves are per Switch
+  user and the runtime has one fixed user (`svc_account.cpp`, GetUserCount 1); "Add New User" calls the account
+  applet, an empty stub. Not fixed yet.
+- **A 7 min play session on the S23** (screen recording + nx.log): two courses, correct picture, no crash; 60 fps with
+  the replay at 10.5-12 ms, 30 fps stretches when it passes ~15 ms (Wonder effect, heavier course parts);
+  2,167 pipelines created in 17.7 s. Details in MEMORY-1810.md §3b.
 - **PRs:** #12 (leonardo-spy) merged: fixed today's Windows build break (`getpid`) and the PC packer's `main.npdm`
   path. #11 (Mac address space, recompiler jump tables) validated on Linux (regenerated code, full build, a 220 s run
   to the castle without a crash); not merged yet (one benchmark at 58.8 vs 60.0 fps to recheck). #10 waits for #11.

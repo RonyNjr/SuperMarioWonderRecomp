@@ -87,8 +87,11 @@ The details are in the GitHub milestones.
 - **Windowed confirmation of the W7 glitch fixes (#43-#45, #47):** horizon band, silhouettes, present mode.
 - **Character-select blur:** needs a reference from a real console.
 - **Android rendering bugs and performance:** hand-off notes in [docs/nvn/android-perf/](docs/nvn/android-perf/).
-- **Save: a second gameplay save cannot be created when one already exists** (reported on the Galaxy S23,
-  2026-10-18; not investigated yet).
+- **Save: a second gameplay save cannot be created when one already exists** (Galaxy S23, 2026-10-18). Wonder keeps
+  one save per Switch user, and the runtime has exactly one user (`Zagreus`, `runtime/src/svc_account.cpp`:
+  GetUserCount is 1). "Add New User" opens the system's account applet (`ILibraryAppletCreator`), which is an empty
+  stub, so nothing happens. Needs more local users (e.g. a users list in the data folder, one save folder each)
+  and an answer to the profile-creation applet.
 - **Android: memory pressure and new-shader hitches on the Galaxy S23.** In the course the CPU replay reaches
   17-18 ms because Android pushes up to 1.8 GB of the game to zram (major faults on the render thread); the GPU
   waits only 0.1-2 ms. The first time a shader appears its pipeline is compiled on the render thread (905

@@ -48,6 +48,21 @@ shaders appear": the first time a shader/state combination is drawn, the Adreno 
 thread. The cache makes the second time free. Options (not done): load every cached pipeline at start, and compile
 new ones on a worker thread while the frame draws without them.
 
+## 3b. A longer play session (7 min screen recording, same settings, 280 windows)
+
+The player's recording (opening course with its Wonder effect, then "Piranha Plants on Parade", saving, world
+map) and its nx.log: no crash; the picture is right throughout (no black silhouettes; widescreen fills the screen).
+
+- At 60 fps the replay takes **10.5-12 ms** per frame and the GPU waits under 0.1 ms. When the replay goes past about
+  15 ms the game switches to its 30 fps mode and stays there for 10-20 windows (the Wonder effect, parts of the
+  Piranha Plant course, the course-clear screens), then comes back to 60.
+- In the 30 fps stretches the GPU still waits only 0.1-5 ms: the limit stays the CPU.
+- **2,167 pipelines were created in 17.7 s** of replay-thread time during the session, despite the loaded cache:
+  pipeline creation is part of the replay cost, not only a first-time hitch.
+- Memory: swapped 536 → 1818 MB, anon resident 1045 → 574 MB, MemAvailable 790-1000 MB.
+
+So two levers matter most on the S23: keep the game out of zram, and take pipeline creation off the replay thread.
+
 ## 4. Changes in this round
 
 | Change | State |
