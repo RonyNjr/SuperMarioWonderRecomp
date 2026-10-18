@@ -108,6 +108,26 @@ bool staging_wanted(uint64_t size) {
     return always || !ring || frame_upload_used() + size > ring / 4 || size > ring / 8;
 }
 
+// Which uploads may get a staging buffer at all: 1 MB and up, and, once this submit has put a quarter of the ring
+// in the ring already (a scene load), 64 KB and up. NX_STAGING_LOAD=0: the 1 MB floor only, as before.
+bool staging_candidate(uint64_t size) {
+    static const bool load = [] {
+        const char* e = std::getenv("NX_STAGING_LOAD");
+        return !(e && e[0] == '0');
+    }();
+    if (size >= (1u << 20)) return true;
+    uint64_t ring = frame_ring_size();
+    return load && ring && size >= (64u << 10) && frame_upload_used() > ring / 4;
+}
+
+// Room for one texture's upload: a staging buffer of its own when it is big (or the submit already is), else the ring.
+// NX_STAGING_RING=1: always the ring, as before (bisecting).
+Upload texture_stage(uint64_t size) {
+    static const bool ring_only = std::getenv("NX_STAGING_RING") != nullptr;
+    if (!ring_only && staging_candidate(size) && staging_wanted(size)) return staging_alloc(size);
+    return upload_alloc(size, 16);
+}
+
 }  // namespace
 
 // NX_1D_IMAGES=1: NVN 1D textures as Vulkan 1D images again (they are 2D of height 1: Ryujinx samples 1D as 2D, G8).
@@ -161,7 +181,7 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_
         if (was_uploaded && layers == 1 && !full_upload() && hi != UINT64_MAX)
             y0 = std::min(rows, lo / t.stride), y1 = std::min(rows, (hi + t.stride - 1) / t.stride);
         if (y1 <= y0) return;
-        Upload u = upload_alloc((y1 - y0) * img.width * 4, 16);
+        Upload u = texture_stage((y1 - y0) * img.width * 4);  // the 2048x8192 glyph atlas: 64 MB at its first upload
         for (uint64_t y = y0; y < y1; y++) {
             const uint8_t* s = src + y * t.stride;
             uint32_t* d = reinterpret_cast<uint32_t*>(u.ptr + (y - y0) * img.width * 4);
@@ -198,7 +218,7 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_
             uint64_t n = rows * layers, have = std::min<uint64_t>(n, t.storage_size / t.stride);
             uint64_t texels = std::min<uint64_t>(img.width, t.stride / 4);
             staged = n * img.width * 8;
-            u = upload_alloc(staged, 16);
+            u = texture_stage(staged);
             std::memset(u.ptr, 0, staged);
             for (uint64_t y = 0; y < have; y++) widen_r11g11b10(src + y * t.stride, u.ptr + y * img.width * 8, texels);
         } else {
@@ -210,7 +230,8 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_
                 r.imageExtent = {img.width, uint32_t(y1 - y0), 1};
             }
             staged = uint64_t(t.stride) * (y1 - y0) * layers;
-            u = upload(reinterpret_cast<const uint8_t*>(t.memory) + y0 * t.stride, staged, 16);
+            u = texture_stage(staged);
+            std::memcpy(u.ptr, reinterpret_cast<const uint8_t*>(t.memory) + y0 * t.stride, staged);
             r.bufferRowLength = t.stride / bytes * bw;
         }
         r.bufferOffset = u.offset;
@@ -252,18 +273,11 @@ void upload_texture(VkCommandBuffer cb, const Texture& t, GpuImage& img, uint64_
     }
     // Widened, every offset in the linear buffer doubles (level offsets are multiples of the 4-byte texel).
     uint64_t scale = widen ? 2 : 1;
-    Upload u;
-    if (widen) {
-        u = upload_alloc(linear.size() * 2, 16);
+    Upload u = texture_stage(linear.size() * scale);
+    if (widen)
         widen_r11g11b10(linear.data(), u.ptr, linear.size() / 4);
-    } else if (linear.size() >= (1u << 20) && !std::getenv("NX_STAGING_RING") && staging_wanted(linear.size())) {
-        // 1 MB and up: a staging buffer of its own, so a scene load cannot wrap the ring over itself (DEBUG-2 #72).
-        // NX_STAGING_RING=1: through the ring, as before (bisecting).
-        u = staging_alloc(linear.size());
+    else
         std::memcpy(u.ptr, linear.data(), linear.size());
-    } else {
-        u = upload(linear.data(), linear.size(), 16);
-    }
     for (uint32_t k = 0; k < levels.size(); k++) {
         VkBufferImageCopy r{};
         r.bufferOffset = u.offset + levels[k].offset * scale;

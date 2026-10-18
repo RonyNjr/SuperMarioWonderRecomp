@@ -86,7 +86,12 @@ Upload staging_alloc(uint64_t size);
 // nvn_pipeline_cache.cpp: the on-disk pipeline cache, and the cost of what the replay creates (logged per window).
 VkPipelineCache pipeline_cache();
 void pipeline_cache_save();
-void note_pipeline_created(uint64_t ns);
+void note_pipeline_created(uint64_t ns, bool worker);  // worker: compiled off the replay thread
+void note_pipeline_alias();               // a new raw key that maps to a pipeline already built (canonical_key)
+void note_module_created(uint64_t ns);    // a shader module built (SPIR-V patches + vkCreateShaderModule)
+void note_pipeline_waited(uint64_t ns);   // the replay waited this long for a compile in flight
+void note_pipeline_skipped();             // a draw skipped because its pipeline compiles (NX_ASYNC_PIPELINES)
+void note_pipeline_prewarmed();           // a pipeline of an earlier session sent to a worker
 void note_astc_decoded(uint64_t ns);
 void creation_log(uint64_t frames);
 Upload upload(const void* data, uint64_t size, uint64_t align);
@@ -94,6 +99,7 @@ Upload upload(const void* data, uint64_t size, uint64_t align);
 // Descriptor sets for this submit (freed when it completes).
 VkDescriptorSet descriptor_set(VkDescriptorSetLayout layout);
 VkDescriptorPool make_descriptor_pool();
+bool descriptor_layout_counts(VkDescriptorSetLayout layout, uint32_t (&by_type)[16]);  // descriptors of a layout, by VkDescriptorType (nvn_pipeline.cpp)
 
 // A lost device or a submit running past 2 s: the process ends at once (docs/nvn/DEBUG.md #22).
 [[noreturn]] void gpu_hung(const char* why);

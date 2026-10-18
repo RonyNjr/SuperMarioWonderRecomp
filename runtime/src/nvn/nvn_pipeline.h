@@ -78,6 +78,16 @@ struct PipelineKey {
     float uw_x = 0;  // NX_ULTRAWIDE: gl_Position.x scale of the vertex stage (0: none, the module has no constant)
 };
 VkPipeline graphics_pipeline(const PipelineKey& key, const ProgramLayout& layout);
+// The pipelines an earlier session built (<pipeline cache>.keys): a canonical key with its two shaders by hash
+// (nvn_pipeline_cache.cpp). pipeline_warm_step, once per submit, compiles them on worker threads as the game loads
+// their shaders, and collects finished compiles.
+struct WarmRec {
+    char vs[24], fs[24];  // shader hashes; fs empty without a fragment stage
+    PipelineKey key;      // vs and fs null
+};
+bool warm_load(std::vector<WarmRec>& out);
+void warm_record(const PipelineKey& canonical);  // a pipeline this session built; saved with the cache
+void pipeline_warm_step();
 bool depth_remap();  // NX_CLIP_Z_PATCH: clip z -w..w mapped in the vertex shaders, not by VK_EXT_depth_clip_control
 bool patch_clip_z(const std::vector<uint32_t>& in, std::vector<uint32_t>& out);  // nvn_spirv_clip.cpp
 void clip_z_module(const ShaderInfo* s, std::vector<uint32_t>& code);             // patch_clip_z if depth_remap

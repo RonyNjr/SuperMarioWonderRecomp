@@ -7,6 +7,11 @@
 #include <cstdlib>
 #include <vector>
 
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
+
+#include "nvn_pipeline.h"
 #include "nvn_vk.h"
 #include "platform.h"
 
@@ -20,7 +25,12 @@ VkPipelineCache g_cache = VK_NULL_HANDLE;
 bool g_tried = false;
 size_t g_saved_size = 0;
 std::string g_path;
-uint64_t g_pipelines = 0, g_pipeline_ns = 0, g_astc = 0, g_astc_ns = 0;
+uint64_t g_alias = 0, g_modules = 0, g_module_ns = 0, g_astc = 0, g_astc_ns = 0;
+std::atomic<uint64_t> g_pipelines{0}, g_pipeline_ns{0}, g_worker_pipelines{0}, g_worker_ns{0};  // also counted from the compile worker threads
+uint64_t g_waited = 0, g_waited_ns = 0, g_skipped = 0, g_prewarmed = 0;
+std::unordered_set<uint64_t> g_known;  // hashes of the records in the .keys file or already queued to it
+std::vector<WarmRec> g_new_recs;
+constexpr uint32_t kKeysMagic = 0x314b5750;  // "PWK1"
 
 }  // namespace
 
@@ -68,18 +78,92 @@ void pipeline_cache_save() {
     }
 }
 
-void note_pipeline_created(uint64_t ns) { g_pipelines++, g_pipeline_ns += ns; }
+void note_pipeline_created(uint64_t ns, bool worker) {
+    (worker ? g_worker_pipelines : g_pipelines)++, (worker ? g_worker_ns : g_pipeline_ns) += ns;
+}
+void note_pipeline_waited(uint64_t ns) { g_waited++, g_waited_ns += ns; }
+void note_pipeline_skipped() { g_skipped++; }
+void note_pipeline_prewarmed() { g_prewarmed++; }
+
+// ---- the keys of earlier sessions (<cache path minus .bin>.keys) ---------------------------------------------------
+// Header {magic, sizeof(WarmRec)} then WarmRec records. A file of another layout is ignored (and rewritten).
+
+static std::string keys_path() {
+    pipeline_cache();  // sets g_path
+    return (g_path.size() > 4 ? g_path.substr(0, g_path.size() - 4) : g_path) + ".keys";
+}
+
+static uint64_t rec_hash(const WarmRec& r) { return hash_bytes(reinterpret_cast<const unsigned char*>(&r), sizeof r); }
+
+bool warm_load(std::vector<WarmRec>& out) {
+    if (!pipeline_cache()) return false;
+    FILE* f = plat::fopen_utf8(keys_path(), "rb");
+    if (!f) return false;
+    uint32_t head[2] = {};
+    bool ok = std::fread(head, 4, 2, f) == 2 && head[0] == kKeysMagic && head[1] == sizeof(WarmRec);
+    WarmRec r;
+    while (ok && std::fread(&r, sizeof r, 1, f) == 1) {
+        out.push_back(r);
+        g_known.insert(rec_hash(r));
+    }
+    std::fclose(f);
+    return ok;
+}
+
+void warm_record(const PipelineKey& k) {
+    WarmRec r;
+    std::memset(&r, 0, sizeof r);
+    if (!k.vs || k.vs->hash.size() >= sizeof r.vs || (k.fs && k.fs->hash.size() >= sizeof r.fs)) return;
+    std::memcpy(r.vs, k.vs->hash.c_str(), k.vs->hash.size());
+    if (k.fs) std::memcpy(r.fs, k.fs->hash.c_str(), k.fs->hash.size());
+    r.key = k;
+    r.key.vs = nullptr, r.key.fs = nullptr;
+    if (g_known.size() < 16384 && g_known.insert(rec_hash(r)).second) g_new_recs.push_back(r);  // ~700 bytes each
+}
+
+static void warm_save() {
+    if (g_new_recs.empty() || !g_cache) return;
+    std::string path = keys_path();
+    bool fresh = true;
+    if (FILE* t = plat::fopen_utf8(path, "rb")) {
+        uint32_t head[2] = {};
+        fresh = !(std::fread(head, 4, 2, t) == 2 && head[0] == kKeysMagic && head[1] == sizeof(WarmRec));
+        std::fclose(t);
+    }
+    if (FILE* f = plat::fopen_utf8(path, fresh ? "wb" : "ab")) {
+        if (fresh) {
+            uint32_t head[2] = {kKeysMagic, uint32_t(sizeof(WarmRec))};
+            std::fwrite(head, 4, 2, f);
+        }
+        std::fwrite(g_new_recs.data(), sizeof(WarmRec), g_new_recs.size(), f);
+        std::fclose(f);
+        g_new_recs.clear();
+    }
+}
+void note_pipeline_alias() { g_alias++; }
+void note_module_created(uint64_t ns) { g_modules++, g_module_ns += ns; }
 void note_astc_decoded(uint64_t ns) { g_astc++, g_astc_ns += ns; }
 
 // One line per timing window (nvn_vk.cpp log_timing): what the replay created, and the time it took.
 void creation_log(uint64_t frames) {
     if (g_pipelines || g_astc)
         log("nvn/vk: created over %llu frames: %llu pipelines (%.1f ms), %llu ASTC textures decoded (%.1f ms)",
-            (unsigned long long)frames, (unsigned long long)g_pipelines, double(g_pipeline_ns) / 1e6,
+            (unsigned long long)frames, (unsigned long long)g_pipelines.load(), double(g_pipeline_ns.load()) / 1e6,
             (unsigned long long)g_astc, double(g_astc_ns) / 1e6);
-    g_pipelines = g_pipeline_ns = g_astc = g_astc_ns = 0;
+    if (g_alias || g_modules)
+        log("nvn/vk: over %llu frames: %llu raw keys shared an existing pipeline, %llu shader modules (%.1f ms)",
+            (unsigned long long)frames, (unsigned long long)g_alias, (unsigned long long)g_modules, double(g_module_ns) / 1e6);
+    g_alias = g_modules = g_module_ns = 0;
+    if (g_prewarmed || g_skipped || g_waited || g_worker_pipelines)
+        log("nvn/vk: over %llu frames: %llu pipelines sent to workers, %llu compiled there (%.1f ms), the replay waited for %llu (%.1f ms), %llu draws skipped",
+            (unsigned long long)frames, (unsigned long long)g_prewarmed, (unsigned long long)g_worker_pipelines.load(),
+            double(g_worker_ns.load()) / 1e6, (unsigned long long)g_waited, double(g_waited_ns) / 1e6,
+            (unsigned long long)g_skipped);
+    g_worker_pipelines = 0, g_worker_ns = 0;
+    g_prewarmed = g_waited = g_waited_ns = g_skipped = 0;
+    g_pipelines = 0, g_pipeline_ns = 0, g_astc = g_astc_ns = 0;
     static uint64_t windows = 0;
-    if (++windows % 10 == 0) pipeline_cache_save();
+    if (++windows % 10 == 0) pipeline_cache_save(), warm_save();
 }
 
 }  // namespace nx::nvn
