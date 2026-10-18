@@ -229,6 +229,17 @@ uint32_t ipc_request(CPU& c, uint32_t handle, uint64_t buf, uint64_t) {
         }
     } else {
         if (g_trace) log("ipc: %s cmd %u", target->name.c_str(), ctx.cmd);
+        if (sess->domain) {
+            for (uint32_t id : ctx.in_objects) {
+                auto it = sess->dom->objects.find(id);
+                ctx.in_services.push_back(it == sess->dom->objects.end() ? nullptr : it->second);
+            }
+        } else {
+            for (uint32_t h : ctx.in_move) {
+                auto k = std::dynamic_pointer_cast<KSession>(handle_get(h));
+                ctx.in_services.push_back(k ? k->svc : nullptr);
+            }
+        }
         rc = target->handle(ctx);
     }
 

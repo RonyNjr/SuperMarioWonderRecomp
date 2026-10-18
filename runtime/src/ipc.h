@@ -28,6 +28,7 @@ struct IpcCtx {
     uint64_t pid = 0;
     std::vector<Buffer> a, b, x, c;  // send, receive, pointer (X), receive list (C)
     std::vector<uint32_t> in_objects;  // domain objects passed in
+    std::vector<std::shared_ptr<Service>> in_services;  // the interfaces passed in (domain objects or moved sessions), resolved
 
     std::vector<uint8_t> out;
     std::vector<uint32_t> out_copy, out_move;
@@ -69,6 +70,9 @@ struct ServiceRegistrar {
 };
 
 std::shared_ptr<Service> make_storage(std::vector<uint8_t> data);
+std::shared_ptr<Service> make_storage(std::shared_ptr<std::vector<uint8_t>> blob);  // shared, writable
+// The bytes behind an IStorage made by make_storage (null for any other service).
+std::shared_ptr<std::vector<uint8_t>> storage_blob(const std::shared_ptr<Service>& s);
 std::shared_ptr<Service> preselected_user_storage();
 
 // Kernel shared memory owned by a service (hid, etc.)

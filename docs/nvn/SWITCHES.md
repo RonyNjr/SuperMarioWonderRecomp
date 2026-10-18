@@ -65,6 +65,7 @@ Shaders: `spirv-cross private/wonder/spirv/<hash>.spv --version 450` shows the t
 | `NX_MUTE=1` | no sound device (also implied by `NX_HEADLESS`) | platform_win.cpp, platform_mac.cpp |
 | `NX_FULLSCREEN=1` | start fullscreen (F11 / Alt+Enter toggle) | platform_win.cpp |
 | `NX_HANDHELD=1` | handheld mode: the game renders for 1280x720 | svc_am.cpp |
+| `NX_USER=<n>` | the user the game boots into and answers as the last opened one: the n-th line of `<data root>/users.txt` (1 = the first). Users are created at "Add New User"; rename one by editing its line in `users.txt` | users.cpp, svc_account.cpp |
 | `NX_ASTC_DECODE=1|linear|srgb|<hex>,...` | ASTC decoded on the CPU even where the GPU has it (all, one half, or the listed NVN formats) (compare with the hardware decoder; DEBUG-2 #69) | nvn_vk.cpp, nvn_upload.cpp |
 | `NX_NO_PASS_BARRIER=1` | no barrier after render passes, as before DEBUG-2 #71 (bisecting) | nvn_draw.cpp |
 | `NX_STAGING_RING=1` | big texture uploads through the upload ring, as before DEBUG-2 #72 (bisecting) | nvn_upload.cpp |
