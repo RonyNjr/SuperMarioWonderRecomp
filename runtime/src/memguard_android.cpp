@@ -53,6 +53,23 @@ uint64_t statm_resident_bytes() {
     return uint64_t(resident) * uint64_t(sysconf(_SC_PAGESIZE));
 }
 
+// Cheap counters (no page-table walk): VmSwap/RssAnon/RssFile from /proc/self/status, MemAvailable/SwapFree from
+// /proc/meminfo. Logged every 30 s next to the resident figure (MEMORY.md item 11).
+uint64_t kb_field(const char* path, const char* key) {
+    FILE* f = std::fopen(path, "r");
+    if (!f) return 0;
+    char line[256];
+    size_t n = std::strlen(key);
+    uint64_t kb = 0;
+    while (std::fgets(line, sizeof line, f))
+        if (std::strncmp(line, key, n) == 0) {
+            kb = std::strtoull(line + n, nullptr, 10);
+            break;
+        }
+    std::fclose(f);
+    return kb;
+}
+
 struct Read {
     std::atomic<uint64_t> begin{0}, end{0};
 };
@@ -106,6 +123,12 @@ void start_memory_guard() {
                     double(f) / double(1ull << 30), smaps ? "Pss (smaps)" : "resident (statm)",
                     double(peak) / double(1ull << 30), gb, double(read_ns) / 120e6, double(read_max) / 1e6);
                 read_ns = read_max = 0;
+                log("memory: anon %llu MB, file %llu MB, swapped %llu MB (VmSwap) | system: MemAvailable %llu MB, SwapFree %llu MB",
+                    (unsigned long long)(kb_field("/proc/self/status", "RssAnon:") >> 10),
+                    (unsigned long long)(kb_field("/proc/self/status", "RssFile:") >> 10),
+                    (unsigned long long)(kb_field("/proc/self/status", "VmSwap:") >> 10),
+                    (unsigned long long)(kb_field("/proc/meminfo", "MemAvailable:") >> 10),
+                    (unsigned long long)(kb_field("/proc/meminfo", "SwapFree:") >> 10));
             }
             if (f > limit) {
                 log("memory: %.2f GB is over the %.1f GB limit (NX_MEM_LIMIT_GB): stopping",
