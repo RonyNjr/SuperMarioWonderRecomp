@@ -87,16 +87,10 @@ The details are in the GitHub milestones.
 - **Windowed confirmation of the W7 glitch fixes (#43-#45, #47):** horizon band, silhouettes, present mode.
 - **Character-select blur:** needs a reference from a real console.
 - **Android rendering bugs and performance:** hand-off notes in [docs/nvn/android-perf/](docs/nvn/android-perf/).
-- **Save: a second gameplay save cannot be created when one already exists** (Galaxy S23, 2026-10-18). Wonder keeps
-  one save per Switch user, and the runtime has exactly one user (`Zagreus`, `runtime/src/svc_account.cpp`:
-  GetUserCount is 1). "Add New User" opens the system's account applet (`ILibraryAppletCreator`), which is an empty
-  stub, so nothing happens. Needs more local users (e.g. a users list in the data folder, one save folder each)
-  and an answer to the profile-creation applet.
-- **Android: memory pressure and new-shader hitches on the Galaxy S23.** In the course the CPU replay reaches
-  17-18 ms because Android pushes up to 1.8 GB of the game to zram (major faults on the render thread); the GPU
-  waits only 0.1-2 ms. The first time a shader appears its pipeline is compiled on the render thread (905
-  pipelines, 6.9 s in one run). Measured in [docs/nvn/android-perf/MEMORY-1810.md](docs/nvn/android-perf/MEMORY-1810.md),
-  with the plan.
+- **Android: memory pressure on the Galaxy S23.** In the course the CPU replay reaches 17-18 ms because Android
+  pushes up to 1.8 GB of the game to zram (major faults on the render thread); the GPU waits only 0.1-2 ms.
+  Measured in [docs/nvn/android-perf/MEMORY-1810.md](docs/nvn/android-perf/MEMORY-1810.md), with the plan. The
+  new-shader hitches have a first fix (below); neither change has run on a phone yet.
 - **Windows: crash after character select (#5):** not reproduced on Linux; the crash is a rail object whose
   parameter resource was not found (analysis in [docs/nvn/DEBUG-2.md](docs/nvn/DEBUG-2.md), entry #93). Crash
   reports now end with the last files the game opened, to find the missing one.
@@ -238,7 +232,23 @@ the game on the phone from a folder with your `prod.keys` and your XCI/NSP, has 
   refuses the update (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`). Uninstall first; that deletes the imported data in the
   app folder (import again; keep a copy of `user/save` first).
 - **Memory log (2026-10-18):** every 30 s nx.log shows `memory: anon, file, swapped (VmSwap) | MemAvailable, SwapFree`;
-  `NX_UPLOAD_RING_MB=<16..1024>` sets the upload ring (128 MB by default on Android).
+  `NX_UPLOAD_RING_MB=<16..1024>` sets the upload ring (64 MB by default on Android since 2026-10-18, 256 elsewhere).
+
+### Users and saves, pipelines (2026-10-18)
+
+- **Several users, one save each (fixed).** Wonder keeps one save per Switch user; the runtime had one fixed user, so
+  "Add New User" did nothing and no second save could exist. Now the users live in `<data root>/users.txt`
+  (`<uid> <nickname>` per line, up to 8; the first one keeps the old uid, so existing saves load unchanged), "Add New
+  User" answers the system's account applet (playerSelect, UserCreator) with a new user ("Player 2", ...), and each
+  user has its own save folder (`user/save` for the first, `user/save_<uid>` for the others). `NX_USER=<n>` picks
+  the user to boot with; rename one by editing `users.txt`. Checked on Linux: two users listed, the second one plays
+  its own new game, the first save byte for byte unchanged. Details: [docs/nvn/DEBUG-2.md](docs/nvn/DEBUG-2.md) #94.
+- **Pipelines off the render thread.** The pipelines a session builds are remembered (`pipelines_*.keys` next to the
+  cache) and compiled on 2 worker threads at the next start, as the game loads their shaders; pipeline keys ignore
+  state Vulkan does not read (about 18% fewer pipelines). On the Intel, a warm second run built 44 pipelines on the
+  render thread instead of 255 (0.7 ms instead of 8.7). On the S23 a 7 minute session had built 2,167 pipelines in
+  17.7 s on the render thread; the effect there is expected, not measured.
+  Details: [docs/nvn/android-perf/PIPELINES-1810.md](docs/nvn/android-perf/PIPELINES-1810.md).
 - Measurements, recommended settings, what has and has not run on a device: [docs/WONDER-ANDROID-OPTIONS.md](docs/WONDER-ANDROID-OPTIONS.md).
 
 Touch controls:
@@ -294,6 +304,8 @@ Useful switches:
 | `NX_DISPLAY_HZ=<hz>` | experimental: vsync at another rate; the game runs faster or slower, not smoother |
 | `NX_ZERO_VS_OUTPUTS=0` | keeps unwritten vertex outputs undefined (the fix for black characters on Intel is on by default, not on Apple) |
 | `NX_POWER_PROFILE=0/1` | Linux: never / always hold the performance power profile while playing (default: on integrated GPUs) |
+| `NX_USER=<n>` | boot as the n-th user of `<data root>/users.txt` (users are added with "Add New User") |
+| `NX_PIPE_THREADS=<n>` / `NX_PIPE_PREWARM=0` | pipeline compile workers (2; 0 = all on the render thread) / no prewarm from the last session's keys |
 
 Every debug switch (draw traces, snapshots, bisecting toggles) is listed in [docs/nvn/SWITCHES.md](docs/nvn/SWITCHES.md).
 

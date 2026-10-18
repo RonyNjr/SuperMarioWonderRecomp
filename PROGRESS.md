@@ -23,6 +23,15 @@ NVN implemented over Vulkan (MoltenVK).
 
 ## Log
 
+### 2026-10-18 (later): two users and saves, pipelines on worker threads
+
+- **Second save fixed:** local users in `users.txt`, the account applet (playerSelect / UserCreator) answered, one
+  save folder per user; verified on Linux (two users, separate saves, the first save unchanged). DEBUG-2 #94.
+- **Pipelines:** canonical keys (-18%), the session's pipelines recorded and prewarmed on 2 workers at the next
+  start (Intel warm run: 255 → 44 on the render thread), heavy submits' uploads through staging, Android ring 64 MB.
+  [PIPELINES-1810.md](docs/nvn/android-perf/PIPELINES-1810.md). Checked after merging: Intel 60.0 fps, RTX 59.9,
+  no crash. Not yet run on the S23.
+
 ### 2026-10-18: Galaxy S23 analysis, a save bug, PR review
 
 - **S23, what is heavy** ([docs/nvn/android-perf/MEMORY-1810.md](docs/nvn/android-perf/MEMORY-1810.md)): with widescreen,
