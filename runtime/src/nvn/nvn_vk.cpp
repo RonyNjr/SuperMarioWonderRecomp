@@ -257,11 +257,17 @@ bool init() {
 
     // A busy submit reached 67 MB (uniforms padded to 4 KB, storage to 64 KB). Android: 128 MB, half, for an 8 GB
     // phone (docs/nvn/android-perf/MEMORY.md: the phone never filled it; big uploads have staging buffers, #72).
+    {
 #if defined(__ANDROID__)
-    make_upload_buffer(128ull << 20);
+        uint64_t ring_mb = 128;
 #else
-    make_upload_buffer(256ull << 20);
+        uint64_t ring_mb = 256;
 #endif
+        if (const char* e = std::getenv("NX_UPLOAD_RING_MB"))  // config.txt; 16..1024
+            if (long v = std::atol(e); v >= 16 && v <= 1024) ring_mb = uint64_t(v);
+        log("nvn/vk: upload ring %llu MB", (unsigned long long)ring_mb);
+        make_upload_buffer(ring_mb << 20);
+    }
     if (async_gpu())
         frame_init(g_pool, g_family, g_upload, g_upload_ptr, g_upload_size);  // the upload buffer: the slots' ring
     else
