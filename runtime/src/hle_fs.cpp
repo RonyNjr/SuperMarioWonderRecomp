@@ -21,6 +21,7 @@
 #include <nx/runtime.h>
 
 #include "platform.h"
+#include "users.h"
 
 namespace fs = std::filesystem;
 
@@ -139,12 +140,25 @@ void MountRom(CPU& c) {
     c.x[0] = kOk;
 }
 
-void EnsureSaveData(CPU& c) { c.x[0] = kOk; }
+// The save folder of the account::Uid at a guest address: user/save for the first user, user/save_<uid> for the others.
+fs::path save_dir_of(uint64_t uid_addr) {
+    uint64_t lo = ld<uint64_t>(uid_addr), hi = ld<uint64_t>(uid_addr + 8);
+    user_opened(lo, hi);
+    return data_root() / "user" / user_save_dir(lo, hi);
+}
+
+void EnsureSaveData(CPU& c) {
+    std::error_code ec;
+    fs::path p = save_dir_of(c.x[0]);
+    fs::create_directories(p, ec);
+    log("fs: EnsureSaveData -> %s", p.string().c_str());
+    c.x[0] = kOk;
+}
 
 void MountSaveData(CPU& c) {
     std::lock_guard lk(g_fs);
     std::string name = cstr(c.x[0]);
-    mount(name, data_root() / "user" / "save");
+    mount(name, save_dir_of(c.x[1]));
     c.x[0] = kOk;
 }
 

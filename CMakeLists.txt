@@ -100,6 +100,7 @@ set(NX_RUNTIME_SOURCES
     runtime/src/svc_process.cpp
     runtime/src/hle_fs.cpp
     runtime/src/svc_account.cpp
+    runtime/src/users.cpp
     runtime/src/hle_ro.cpp
     runtime/src/hle_vi.cpp
     runtime/src/hle_hid.cpp

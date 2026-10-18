@@ -508,3 +508,34 @@ GitHub (issues #43-#48): the glitches in the user's recording of course 1-1 (`do
       loading. `NX_TRACE_FS=1` also logs `OpenDirectory` and host open failures (with errno).
     - To close it: the reporter's `CRASH` block now shows which stage was loading; with `NX_TRACE_FS=1` the lines
       `not found` / `failed to open on the host` before it tell which rail resource is missing on that machine.
+
+94. **"Add New User" did nothing: one fixed user, no account applet, one save folder.**
+    - Symptom: on the "Select a User" screen the game listed one user (Zagreus) and "+ Add New User"; pressing A on the
+      latter did nothing, so a second save could never exist (Wonder keeps one save per Switch user).
+    - Cause: three fixed things. `acc:u0` answered for exactly one uid (count, lists, profile, last opened, the preselected
+      launch parameter). `MountSaveData`/`EnsureSaveData` ignored the `account::Uid` they receive and always mounted
+      `user/save`. And the game never got as far as asking for the applet: it first waits on
+      `ISelfController::GetLibraryAppletLaunchableEvent` (cmd 9), which was an unimplemented stub with no handle; then it
+      creates the applet through `ILibraryAppletCreator` (an empty stub).
+    - What the game asks (logged as `am: ...`): `CreateLibraryApplet(id 0x10 = playerSelect, mode 0)`; two `PushInData`
+      storages: the 32-byte common arguments (`01000000 20000000 ...`: version 1, size 0x20) and the 160-byte
+      `PselUiSettings`, whose first u32 is the UiMode: `1` = UserCreator ("Add New User"). Then `Start`, wait on
+      `GetAppletStateChangedEvent`, `GetResult`, `PopOutData`. The runtime answers a 0x18-byte `{u64 result; Uid}`
+      (Switchbrew's PselUiReturnArg; result 0 = ok, 2 = nothing chosen, e.g. when 8 users exist). UiMode 0
+      (UserSelector) answers with the last opened user; other modes are logged (`UiMode n not handled`).
+    - Fix: `runtime/src/users.cpp` keeps the local users in `<data root>/users.txt` (one `<32 hex digits of the uid>
+      <nickname>` per line, up to 8), created on first run with the old user (Zagreus, uid `...0001`, so existing saves
+      load unchanged). `acc:u0` (count, existence, ListAll/Open/Qualified, GetProfile, GetLastOpenedUser, the
+      preselected launch parameter, TrySelectUserWithoutInteraction) answers from that list. The save folder follows
+      the uid (`MountSaveData`/`EnsureSaveData` read it): `user/save` for the first user, `user/save_<uid hex>` for the
+      others. The applet is emulated in `svc_am.cpp` (`ILibraryAppletCreator`, `ILibraryAppletAccessor`, writable
+      `IStorage`; `IpcCtx::in_services` resolves interfaces passed as arguments): "Add New User" creates "Player 2",
+      "Player 3", ... and returns its uid; the game then lists it and starts a new save for it. To rename a user, edit its
+      line in `users.txt`.
+    - Switches: `NX_USER=<n>` (1 = first line of `users.txt`) is the user the runtime preselects and reports as last
+      opened. The game's own select screen still starts with the cursor on the first card.
+    - Check (Linux, headless, NVIDIA, copy of the data root): the first user boots into its own save (its saved
+      character, Luigi) with `user/save` byte-identical afterwards; "Add New User" shows Player 2 beside Zagreus; Player 2
+      goes through the player count, character select (Mario, no saved choice) and the opening, writing
+      `user/save_<uid>` (`game_data.sav` differs from the first user's); a later boot (`NX_USER=2`) lists both users and
+      mounts each one's own folder. Not checked: progress past the opening for the second user, 8 users, Android/Windows/macOS.
