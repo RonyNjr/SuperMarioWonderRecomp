@@ -67,6 +67,10 @@ struct PadState {
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
 };
 void read_pad(PadState& p);  // player 1
+// Players 2.. (index 1..kMaxPlayers-1): one more game controller each. false while that player has none, and on
+// platforms that only drive player 1.
+constexpr int kMaxPlayers = 4;
+bool read_player_pad(int index, PadState& p);
 // Touch controls to draw over the picture (touch_layout.cpp, platform_android_input.cpp): circles at x, y (0..1
 // across the landscape screen), radius r (a fraction of its height), opacity alpha. 0 where nothing is drawn.
 struct OverlayShape {

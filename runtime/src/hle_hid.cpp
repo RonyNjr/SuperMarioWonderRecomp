@@ -1,5 +1,6 @@
-// nn::hid at the API level: player 1's Npad state comes from the platform (XInput + keyboard on Windows, game
-// controllers + touch on Android). Vibration is accepted and dropped.
+// nn::hid at the API level: the Npad states come from the platform (player 1: XInput + keyboard on Windows, game
+// controllers + touch on Android; players 2-4: one more controller each where the platform has them, macOS for now).
+// Vibration is accepted and dropped.
 #include <array>
 #include <atomic>
 #include <deque>
@@ -53,13 +54,45 @@ std::vector<Scripted> input_script() {
     return v;
 }
 
+void stick_buttons(PadState& p);
+
 PadState read() {
     PadState p;
     static const std::vector<Scripted> script = input_script();
     for (const auto& s : script)
         if (g_frame >= s.frame && g_frame < s.frame + 8) p.buttons |= s.buttons;
     read_pad(p);
-    // Stick directions as buttons, like the hid sysmodule reports them.
+    stick_buttons(p);
+    return p;
+}
+
+// Npad ids No1..No4 are 0..3. Player 1 is always connected (keyboard at least); the others while the platform has
+// a controller for them.
+bool read_player(uint32_t id, PadState& p) {
+    if (id == 0) {
+        p = read();
+        return true;
+    }
+    if (id >= uint32_t(kMaxPlayers) || !read_player_pad(int(id), p)) return false;
+    stick_buttons(p);
+    return true;
+}
+
+bool connected(uint32_t id) {
+    PadState p;
+    bool on = read_player(id, p);
+    static std::mutex m;
+    static bool was[kMaxPlayers] = {true};
+    std::lock_guard lk(m);
+    if (id < uint32_t(kMaxPlayers) && on != was[id]) {
+        was[id] = on;
+        log("hid: player %u %s", id + 1, on ? "connected" : "disconnected");
+    }
+    return on;
+}
+
+// Stick directions as buttons, like the hid sysmodule reports them.
+void stick_buttons(PadState& p) {
     constexpr int32_t t = kStickMax / 2;
     if (p.lx < -t) p.buttons |= kStickLLeft;
     if (p.lx > t) p.buttons |= kStickLRight;
@@ -69,7 +102,6 @@ PadState read() {
     if (p.rx > t) p.buttons |= kStickRRight;
     if (p.ry > t) p.buttons |= kStickRUp;
     if (p.ry < -t) p.buttons |= kStickRDown;
-    return p;
 }
 
 // NpadFullKeyState / NpadJoyDualState / NpadHandheldState:
@@ -85,10 +117,14 @@ void GetNpadState(CPU& c) {
         std::lock_guard lk(m);
         if (seen.insert({id, hle_current_name()}).second) log("hid: reads id %#x via %s", id, hle_current_name());
     }
-    if (id != 0) return;  // only player 1 is connected
-    PadState p = read();
-    static bool pressed = false;
-    if (p.buttons && !pressed) log("hid: first buttons %llx", (unsigned long long)p.buttons), pressed = true;
+    PadState p;
+    if (!read_player(id, p)) return;  // no controller for that player
+    static bool pressed[kMaxPlayers] = {};
+    if (p.buttons && !pressed[id]) {
+        if (id == 0) log("hid: first buttons %llx", (unsigned long long)p.buttons);
+        else log("hid: player %u's first buttons %llx", id + 1, (unsigned long long)p.buttons);
+        pressed[id] = true;
+    }
     st<uint64_t>(out + 8, p.buttons);
     st<int32_t>(out + 16, p.lx);
     st<int32_t>(out + 20, p.ly);
@@ -115,15 +151,18 @@ void GetNpadStatesFullKey(CPU& c) {
         return;
     }
     static std::mutex m;
-    static std::deque<std::array<uint8_t, 0x28>> history;
+    static std::deque<std::array<uint8_t, 0x28>> histories[kMaxPlayers];  // one per player
     std::lock_guard lk(m);
+    uint32_t id = ld<uint32_t>(id_ref);
     c.x[0] = out;
     c.x[1] = id_ref;
     GetNpadState(c);  // the new sample, into out[0]
-    if (ld<uint32_t>(id_ref) != 0) {
+    if (id >= uint32_t(kMaxPlayers) || !connected(id)) {
+        if (id < uint32_t(kMaxPlayers)) histories[id].clear();
         c.x[0] = 1;
         return;
     }
+    auto& history = histories[id];
     std::array<uint8_t, 0x28> now;
     std::memcpy(now.data(), reinterpret_cast<const void*>(out), now.size());
     history.push_front(now);
@@ -172,8 +211,9 @@ void one(CPU& c) { c.x[0] = 1; }
 
 void GetNpadStyleSet(CPU& c) {
     static int logged = 0;
-    if (logged++ < 4) log("hid: GetNpadStyleSet id %#x", ld<uint32_t>(c.x[0]));
-    c.x[0] = ld<uint32_t>(c.x[0]) == 0 ? kStyleFullKey : 0;
+    uint32_t id = ld<uint32_t>(c.x[0]);
+    if (logged++ < 4) log("hid: GetNpadStyleSet id %#x", id);
+    c.x[0] = connected(id) ? kStyleFullKey : 0;
 }
 
 void BindNpadStyleSetUpdateEvent(CPU& c) {  // (const u32& id, SystemEventType*, EventClearMode)
@@ -196,7 +236,10 @@ void BindNpadStyleSetUpdateEvent(CPU& c) {  // (const u32& id, SystemEventType*,
 
 void GetVibrationDeviceHandles(CPU& c) { c.x[0] = 0; }  // no vibration devices
 void ShowControllerSupport(CPU& c) {                     // (ControllerSupportResultInfo*, const Arg&)
-    st<int8_t>(c.x[0], 1);        // player count
+    int8_t players = 0;
+    for (uint32_t id = 0; id < uint32_t(kMaxPlayers); id++) players += connected(id);
+    log("hid: controller applet: %d player(s)", players);
+    st<int8_t>(c.x[0], players);  // player count
     st<uint32_t>(c.x[0] + 4, 0);  // selected npad id: No1
     c.x[0] = 0;
 }

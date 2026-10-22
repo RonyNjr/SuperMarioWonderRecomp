@@ -229,6 +229,8 @@ bool headless() {  // NX_HEADLESS (platform.h)
     return on;
 }
 
+bool read_player_pad(int, PadState&) { return false; }  // only player 1 on this platform
+
 void read_pad(PadState& p) {
     XINPUT_STATE xs{};
     if (XInputGetState(0, &xs) == ERROR_SUCCESS) {

@@ -327,6 +327,8 @@ static void sample_input() {
     g_pad = p;
 }
 
+bool read_player_pad(int, PadState&) { return false; }  // only player 1 on this platform
+
 void read_pad(PadState& p) {
     {
         std::lock_guard lk(g_pad_lock);

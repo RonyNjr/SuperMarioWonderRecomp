@@ -286,7 +286,9 @@ in `private/venv`.
    ```sh
    NX_LOG=private/wonder/nx.log private/wonder/build/wonder
    ```
-   It plays with a gamepad (SDL) or the keyboard.
+   It plays with a gamepad (SDL) or the keyboard. Up to four gamepads play together: as on the console, the first
+   one to press a button is player 1, the next player 2, and so on (the keyboard is player 1 too). Buttons follow the
+   Switch's positions, so on an Xbox-style pad the right face button is A.
 
 Useful switches:
 
